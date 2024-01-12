@@ -33,22 +33,31 @@ class FlaxCrossAttnDownBlock2D(nn.Module):
             Dropout rate
         num_layers (:obj:`int`, *optional*, defaults to 1):
             Number of attention blocks layers
-        attn_num_head_channels (:obj:`int`, *optional*, defaults to 1):
+        num_attention_heads (:obj:`int`, *optional*, defaults to 1):
             Number of attention heads of each spatial transformer block
         add_downsample (:obj:`bool`, *optional*, defaults to `True`):
             Whether to add downsampling layer before each final output
+        use_memory_efficient_attention (`bool`, *optional*, defaults to `False`):
+            enable memory efficient attention https://arxiv.org/abs/2112.05682
+        split_head_dim (`bool`, *optional*, defaults to `False`):
+            Whether to split the head dimension into a new axis for the self-attention computation. In most cases,
+            enabling this flag should speed up the computation for Stable Diffusion 2.x and Stable Diffusion XL.
         dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
             Parameters `dtype`
     """
+
     in_channels: int
     out_channels: int
     dropout: float = 0.0
     num_layers: int = 1
-    attn_num_head_channels: int = 1
+    num_attention_heads: int = 1
     add_downsample: bool = True
     use_linear_projection: bool = False
     only_cross_attention: bool = False
+    use_memory_efficient_attention: bool = False
+    split_head_dim: bool = False
     dtype: jnp.dtype = jnp.float32
+    transformer_layers_per_block: int = 1
 
     def setup(self):
         resnets = []
@@ -67,11 +76,13 @@ class FlaxCrossAttnDownBlock2D(nn.Module):
 
             attn_block = FlaxTransformer2DModel(
                 in_channels=self.out_channels,
-                n_heads=self.attn_num_head_channels,
-                d_head=self.out_channels // self.attn_num_head_channels,
-                depth=1,
+                n_heads=self.num_attention_heads,
+                d_head=self.out_channels // self.num_attention_heads,
+                depth=self.transformer_layers_per_block,
                 use_linear_projection=self.use_linear_projection,
                 only_cross_attention=self.only_cross_attention,
+                use_memory_efficient_attention=self.use_memory_efficient_attention,
+                split_head_dim=self.split_head_dim,
                 dtype=self.dtype,
             )
             attentions.append(attn_block)
@@ -115,6 +126,7 @@ class FlaxDownBlock2D(nn.Module):
         dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
             Parameters `dtype`
     """
+
     in_channels: int
     out_channels: int
     dropout: float = 0.0
@@ -168,23 +180,32 @@ class FlaxCrossAttnUpBlock2D(nn.Module):
             Dropout rate
         num_layers (:obj:`int`, *optional*, defaults to 1):
             Number of attention blocks layers
-        attn_num_head_channels (:obj:`int`, *optional*, defaults to 1):
+        num_attention_heads (:obj:`int`, *optional*, defaults to 1):
             Number of attention heads of each spatial transformer block
         add_upsample (:obj:`bool`, *optional*, defaults to `True`):
             Whether to add upsampling layer before each final output
+        use_memory_efficient_attention (`bool`, *optional*, defaults to `False`):
+            enable memory efficient attention https://arxiv.org/abs/2112.05682
+        split_head_dim (`bool`, *optional*, defaults to `False`):
+            Whether to split the head dimension into a new axis for the self-attention computation. In most cases,
+            enabling this flag should speed up the computation for Stable Diffusion 2.x and Stable Diffusion XL.
         dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
             Parameters `dtype`
     """
+
     in_channels: int
     out_channels: int
     prev_output_channel: int
     dropout: float = 0.0
     num_layers: int = 1
-    attn_num_head_channels: int = 1
+    num_attention_heads: int = 1
     add_upsample: bool = True
     use_linear_projection: bool = False
     only_cross_attention: bool = False
+    use_memory_efficient_attention: bool = False
+    split_head_dim: bool = False
     dtype: jnp.dtype = jnp.float32
+    transformer_layers_per_block: int = 1
 
     def setup(self):
         resnets = []
@@ -204,11 +225,13 @@ class FlaxCrossAttnUpBlock2D(nn.Module):
 
             attn_block = FlaxTransformer2DModel(
                 in_channels=self.out_channels,
-                n_heads=self.attn_num_head_channels,
-                d_head=self.out_channels // self.attn_num_head_channels,
-                depth=1,
+                n_heads=self.num_attention_heads,
+                d_head=self.out_channels // self.num_attention_heads,
+                depth=self.transformer_layers_per_block,
                 use_linear_projection=self.use_linear_projection,
                 only_cross_attention=self.only_cross_attention,
+                use_memory_efficient_attention=self.use_memory_efficient_attention,
+                split_head_dim=self.split_head_dim,
                 dtype=self.dtype,
             )
             attentions.append(attn_block)
@@ -255,6 +278,7 @@ class FlaxUpBlock2D(nn.Module):
         dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
             Parameters `dtype`
     """
+
     in_channels: int
     out_channels: int
     prev_output_channel: int
@@ -309,17 +333,26 @@ class FlaxUNetMidBlock2DCrossAttn(nn.Module):
             Dropout rate
         num_layers (:obj:`int`, *optional*, defaults to 1):
             Number of attention blocks layers
-        attn_num_head_channels (:obj:`int`, *optional*, defaults to 1):
+        num_attention_heads (:obj:`int`, *optional*, defaults to 1):
             Number of attention heads of each spatial transformer block
+        use_memory_efficient_attention (`bool`, *optional*, defaults to `False`):
+            enable memory efficient attention https://arxiv.org/abs/2112.05682
+        split_head_dim (`bool`, *optional*, defaults to `False`):
+            Whether to split the head dimension into a new axis for the self-attention computation. In most cases,
+            enabling this flag should speed up the computation for Stable Diffusion 2.x and Stable Diffusion XL.
         dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
             Parameters `dtype`
     """
+
     in_channels: int
     dropout: float = 0.0
     num_layers: int = 1
-    attn_num_head_channels: int = 1
+    num_attention_heads: int = 1
     use_linear_projection: bool = False
+    use_memory_efficient_attention: bool = False
+    split_head_dim: bool = False
     dtype: jnp.dtype = jnp.float32
+    transformer_layers_per_block: int = 1
 
     def setup(self):
         # there is always at least one resnet
@@ -337,10 +370,12 @@ class FlaxUNetMidBlock2DCrossAttn(nn.Module):
         for _ in range(self.num_layers):
             attn_block = FlaxTransformer2DModel(
                 in_channels=self.in_channels,
-                n_heads=self.attn_num_head_channels,
-                d_head=self.in_channels // self.attn_num_head_channels,
-                depth=1,
+                n_heads=self.num_attention_heads,
+                d_head=self.in_channels // self.num_attention_heads,
+                depth=self.transformer_layers_per_block,
                 use_linear_projection=self.use_linear_projection,
+                use_memory_efficient_attention=self.use_memory_efficient_attention,
+                split_head_dim=self.split_head_dim,
                 dtype=self.dtype,
             )
             attentions.append(attn_block)

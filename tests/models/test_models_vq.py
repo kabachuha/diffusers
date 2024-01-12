@@ -18,16 +18,22 @@ import unittest
 import torch
 
 from diffusers import VQModel
-from diffusers.utils import floats_tensor, torch_device
+from diffusers.utils.testing_utils import (
+    backend_manual_seed,
+    enable_full_determinism,
+    floats_tensor,
+    torch_device,
+)
 
-from ..test_modeling_common import ModelTesterMixin
+from .test_modeling_common import ModelTesterMixin, UNetTesterMixin
 
 
-torch.backends.cuda.matmul.allow_tf32 = False
+enable_full_determinism()
 
 
-class VQModelTests(ModelTesterMixin, unittest.TestCase):
+class VQModelTests(ModelTesterMixin, UNetTesterMixin, unittest.TestCase):
     model_class = VQModel
+    main_input_name = "sample"
 
     @property
     def dummy_input(self, sizes=(32, 32)):
@@ -79,15 +85,11 @@ class VQModelTests(ModelTesterMixin, unittest.TestCase):
         model.to(torch_device).eval()
 
         torch.manual_seed(0)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(0)
+        backend_manual_seed(torch_device, 0)
 
         image = torch.randn(1, model.config.in_channels, model.config.sample_size, model.config.sample_size)
         image = image.to(torch_device)
         with torch.no_grad():
-            # Warmup pass when using mps (see #372)
-            if torch_device == "mps":
-                _ = model(image)
             output = model(image).sample
 
         output_slice = output[0, -1, -3:, -3:].flatten().cpu()

@@ -93,7 +93,7 @@ class MagicMixPipeline(DiffusionPipeline):
 
         torch.manual_seed(seed)
         noise = torch.randn(
-            (1, self.unet.in_channels, height // 8, width // 8),
+            (1, self.unet.config.in_channels, height // 8, width // 8),
         ).to(self.device)
 
         latents = self.scheduler.add_noise(
@@ -127,9 +127,9 @@ class MagicMixPipeline(DiffusionPipeline):
                         timesteps=t,
                     )
 
-                    input = (mix_factor * latents) + (
-                        1 - mix_factor
-                    ) * orig_latents  # interpolating between layout noise and conditionally generated noise to preserve layout sematics
+                    input = (
+                        (mix_factor * latents) + (1 - mix_factor) * orig_latents
+                    )  # interpolating between layout noise and conditionally generated noise to preserve layout sematics
                     input = torch.cat([input] * 2)
 
                 else:  # content generation phase

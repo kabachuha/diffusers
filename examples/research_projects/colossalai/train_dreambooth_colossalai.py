@@ -1,9 +1,7 @@
 import argparse
-import hashlib
 import math
 import os
 from pathlib import Path
-from typing import Optional
 
 import colossalai
 import torch
@@ -16,7 +14,8 @@ from colossalai.nn.optimizer.gemini_optimizer import GeminiAdamOptimizer
 from colossalai.nn.parallel.utils import get_static_torch_model
 from colossalai.utils import get_current_device
 from colossalai.utils.model.colo_init_context import ColoInitContext
-from huggingface_hub import HfFolder, Repository, create_repo, whoami
+from huggingface_hub import create_repo, upload_folder
+from huggingface_hub.utils import insecure_hashlib
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -344,16 +343,6 @@ class PromptDataset(Dataset):
         return example
 
 
-def get_full_repo_name(model_id: str, organization: Optional[str] = None, token: Optional[str] = None):
-    if token is None:
-        token = HfFolder.get_token()
-    if organization is None:
-        username = whoami(token)["name"]
-        return f"{username}/{model_id}"
-    else:
-        return f"{organization}/{model_id}"
-
-
 # Gemini + ZeRO DDP
 def gemini_zero_dpp(model: torch.nn.Module, placememt_policy: str = "auto"):
     from colossalai.nn.parallel import GeminiDDP
@@ -405,7 +394,7 @@ def main(args):
                 images = pipeline(example["prompt"]).images
 
                 for i, image in enumerate(images):
-                    hash_image = hashlib.sha1(image.tobytes()).hexdigest()
+                    hash_image = insecure_hashlib.sha1(image.tobytes()).hexdigest()
                     image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
                     image.save(image_filename)
 
@@ -413,21 +402,13 @@ def main(args):
 
     # Handle the repository creation
     if local_rank == 0:
-        if args.push_to_hub:
-            if args.hub_model_id is None:
-                repo_name = get_full_repo_name(Path(args.output_dir).name, token=args.hub_token)
-            else:
-                repo_name = args.hub_model_id
-            create_repo(repo_name, exist_ok=True, token=args.hub_token)
-            repo = Repository(args.output_dir, clone_from=repo_name, token=args.hub_token)
-
-            with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore:
-                if "step_*" not in gitignore:
-                    gitignore.write("step_*\n")
-                if "epoch_*" not in gitignore:
-                    gitignore.write("epoch_*\n")
-        elif args.output_dir is not None:
+        if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
+
+        if args.push_to_hub:
+            repo_id = create_repo(
+                repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
+            ).repo_id
 
     # Load the tokenizer
     if args.tokenizer_name:
@@ -483,9 +464,7 @@ def main(args):
     unet = gemini_zero_dpp(unet, args.placement)
 
     # config optimizer for colossalai zero
-    optimizer = GeminiAdamOptimizer(
-        unet, lr=args.learning_rate, initial_scale=2**5, clipping_norm=args.max_grad_norm
-    )
+    optimizer = GeminiAdamOptimizer(unet, lr=args.learning_rate, initial_scale=2**5, clipping_norm=args.max_grad_norm)
 
     # load noise_scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
@@ -679,7 +658,12 @@ def main(args):
         logger.info(f"Saving model checkpoint to {args.output_dir}", ranks=[0])
 
         if args.push_to_hub:
-            repo.push_to_hub(commit_message="End of training", blocking=False, auto_lfs_prune=True)
+            upload_folder(
+                repo_id=repo_id,
+                folder_path=args.output_dir,
+                commit_message="End of training",
+                ignore_patterns=["step_*", "epoch_*"],
+            )
 
 
 if __name__ == "__main__":

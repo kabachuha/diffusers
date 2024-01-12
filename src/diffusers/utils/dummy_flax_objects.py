@@ -2,6 +2,21 @@
 from ..utils import DummyObject, requires_backends
 
 
+class FlaxControlNetModel(metaclass=DummyObject):
+    _backends = ["flax"]
+
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["flax"])
+
+    @classmethod
+    def from_config(cls, *args, **kwargs):
+        requires_backends(cls, ["flax"])
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        requires_backends(cls, ["flax"])
+
+
 class FlaxModelMixin(metaclass=DummyObject):
     _backends = ["flax"]
 
@@ -93,6 +108,21 @@ class FlaxDDPMScheduler(metaclass=DummyObject):
 
 
 class FlaxDPMSolverMultistepScheduler(metaclass=DummyObject):
+    _backends = ["flax"]
+
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["flax"])
+
+    @classmethod
+    def from_config(cls, *args, **kwargs):
+        requires_backends(cls, ["flax"])
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        requires_backends(cls, ["flax"])
+
+
+class FlaxEulerDiscreteScheduler(metaclass=DummyObject):
     _backends = ["flax"]
 
     def __init__(self, *args, **kwargs):

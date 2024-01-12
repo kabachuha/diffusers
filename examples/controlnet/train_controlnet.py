@@ -18,8 +18,8 @@ import logging
 import math
 import os
 import random
+import shutil
 from pathlib import Path
-from typing import Optional
 
 import accelerate
 import numpy as np
@@ -31,7 +31,7 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
-from huggingface_hub import HfFolder, Repository, create_repo, whoami
+from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from PIL import Image
 from torchvision import transforms
@@ -50,15 +50,27 @@ from diffusers import (
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
+from diffusers.utils.torch_utils import is_compiled_module
 
 
 if is_wandb_available():
     import wandb
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.15.0.dev0")
+check_min_version("0.26.0.dev0")
 
 logger = get_logger(__name__)
+
+
+def image_grid(imgs, rows, cols):
+    assert len(imgs) == rows * cols
+
+    w, h = imgs[0].size
+    grid = Image.new("RGB", size=(cols * w, rows * h))
+
+    for i, img in enumerate(imgs):
+        grid.paste(img, box=(i % cols * w, i // cols * h))
+    return grid
 
 
 def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step):
@@ -75,6 +87,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
         controlnet=controlnet,
         safety_checker=None,
         revision=args.revision,
+        variant=args.variant,
         torch_dtype=weight_dtype,
     )
     pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
@@ -106,7 +119,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
     image_logs = []
 
     for validation_prompt, validation_image in zip(validation_prompts, validation_images):
-        validation_image = Image.open(validation_image)
+        validation_image = Image.open(validation_image).convert("RGB")
 
         images = []
 
@@ -157,6 +170,8 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
         else:
             logger.warn(f"image logging not implemented for {tracker.name}")
 
+        return image_logs
+
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
     text_encoder_config = PretrainedConfig.from_pretrained(
@@ -176,6 +191,43 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: st
         return RobertaSeriesModelWithTransformation
     else:
         raise ValueError(f"{model_class} is not supported.")
+
+
+def save_model_card(repo_id: str, image_logs=None, base_model=str, repo_folder=None):
+    img_str = ""
+    if image_logs is not None:
+        img_str = "You can find some example images below.\n"
+        for i, log in enumerate(image_logs):
+            images = log["images"]
+            validation_prompt = log["validation_prompt"]
+            validation_image = log["validation_image"]
+            validation_image.save(os.path.join(repo_folder, "image_control.png"))
+            img_str += f"prompt: {validation_prompt}\n"
+            images = [validation_image] + images
+            image_grid(images, 1, len(images)).save(os.path.join(repo_folder, f"images_{i}.png"))
+            img_str += f"![images_{i})](./images_{i}.png)\n"
+
+    yaml = f"""
+---
+license: creativeml-openrail-m
+base_model: {base_model}
+tags:
+- stable-diffusion
+- stable-diffusion-diffusers
+- text-to-image
+- diffusers
+- controlnet
+inference: true
+---
+    """
+    model_card = f"""
+# controlnet-{repo_id}
+
+These are controlnet weights trained on {base_model} with new type of conditioning.
+{img_str}
+"""
+    with open(os.path.join(repo_folder, "README.md"), "w") as f:
+        f.write(yaml + model_card)
 
 
 def parse_args(input_args=None):
@@ -199,10 +251,13 @@ def parse_args(input_args=None):
         type=str,
         default=None,
         required=False,
-        help=(
-            "Revision of pretrained model identifier from huggingface.co/models. Trainable model components should be"
-            " float32 precision."
-        ),
+        help="Revision of pretrained model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--variant",
+        type=str,
+        default=None,
+        help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
     )
     parser.add_argument(
         "--tokenizer_name",
@@ -258,11 +313,7 @@ def parse_args(input_args=None):
         "--checkpoints_total_limit",
         type=int,
         default=None,
-        help=(
-            "Max number of checkpoints to store. Passed as `total_limit` to the `Accelerator` `ProjectConfiguration`."
-            " See Accelerator::save_state https://huggingface.co/docs/accelerate/package_reference/accelerator#accelerate.Accelerator.save_state"
-            " for more details"
-        ),
+        help=("Max number of checkpoints to store."),
     )
     parser.add_argument(
         "--resume_from_checkpoint",
@@ -487,7 +538,6 @@ def parse_args(input_args=None):
         "--tracker_project_name",
         type=str,
         default="train_controlnet",
-        required=True,
         help=(
             "The `project_name` argument passed to Accelerator.init_trackers for"
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
@@ -526,6 +576,11 @@ def parse_args(input_args=None):
             " or the same number of `--validation_prompt`s and `--validation_image`s"
         )
 
+    if args.resolution % 8 != 0:
+        raise ValueError(
+            "`--resolution` must be divisible by 8 for consistently sized encoded images between the VAE and the controlnet encoder."
+        )
+
     return args
 
 
@@ -543,16 +598,13 @@ def make_train_dataset(args, tokenizer, accelerator):
             cache_dir=args.cache_dir,
         )
     else:
-        data_files = {}
         if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "**")
-        dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=args.cache_dir,
-        )
+            dataset = load_dataset(
+                args.train_data_dir,
+                cache_dir=args.cache_dir,
+            )
         # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
+        # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
 
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
@@ -581,7 +633,7 @@ def make_train_dataset(args, tokenizer, accelerator):
 
     if args.conditioning_image_column is None:
         conditioning_image_column = column_names[2]
-        logger.info(f"conditioning image column defaulting to {caption_column}")
+        logger.info(f"conditioning image column defaulting to {conditioning_image_column}")
     else:
         conditioning_image_column = args.conditioning_image_column
         if conditioning_image_column not in column_names:
@@ -611,6 +663,7 @@ def make_train_dataset(args, tokenizer, accelerator):
     image_transforms = transforms.Compose(
         [
             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(args.resolution),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ]
@@ -619,6 +672,7 @@ def make_train_dataset(args, tokenizer, accelerator):
     conditioning_image_transforms = transforms.Compose(
         [
             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(args.resolution),
             transforms.ToTensor(),
         ]
     )
@@ -661,26 +715,15 @@ def collate_fn(examples):
     }
 
 
-def get_full_repo_name(model_id: str, organization: Optional[str] = None, token: Optional[str] = None):
-    if token is None:
-        token = HfFolder.get_token()
-    if organization is None:
-        username = whoami(token)["name"]
-        return f"{username}/{model_id}"
-    else:
-        return f"{organization}/{model_id}"
-
-
 def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
 
-    accelerator_project_config = ProjectConfiguration(total_limit=args.checkpoints_total_limit)
+    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
-        logging_dir=logging_dir,
         project_config=accelerator_project_config,
     )
 
@@ -704,21 +747,13 @@ def main(args):
 
     # Handle the repository creation
     if accelerator.is_main_process:
-        if args.push_to_hub:
-            if args.hub_model_id is None:
-                repo_name = get_full_repo_name(Path(args.output_dir).name, token=args.hub_token)
-            else:
-                repo_name = args.hub_model_id
-            create_repo(repo_name, exist_ok=True, token=args.hub_token)
-            repo = Repository(args.output_dir, clone_from=repo_name, token=args.hub_token)
-
-            with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore:
-                if "step_*" not in gitignore:
-                    gitignore.write("step_*\n")
-                if "epoch_*" not in gitignore:
-                    gitignore.write("epoch_*\n")
-        elif args.output_dir is not None:
+        if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
+
+        if args.push_to_hub:
+            repo_id = create_repo(
+                repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
+            ).repo_id
 
     # Load the tokenizer
     if args.tokenizer_name:
@@ -737,11 +772,13 @@ def main(args):
     # Load scheduler and models
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     text_encoder = text_encoder_cls.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
+        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
     )
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision)
+    vae = AutoencoderKL.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
+    )
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
+        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
     )
 
     if args.controlnet_model_name_or_path:
@@ -751,20 +788,27 @@ def main(args):
         logger.info("Initializing controlnet weights from unet")
         controlnet = ControlNetModel.from_unet(unet)
 
+    # Taken from [Sayak Paul's Diffusers PR #6511](https://github.com/huggingface/diffusers/pull/6511/files)
+    def unwrap_model(model):
+        model = accelerator.unwrap_model(model)
+        model = model._orig_mod if is_compiled_module(model) else model
+        return model
+
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
-            i = len(weights) - 1
+            if accelerator.is_main_process:
+                i = len(weights) - 1
 
-            while len(weights) > 0:
-                weights.pop()
-                model = models[i]
+                while len(weights) > 0:
+                    weights.pop()
+                    model = models[i]
 
-                sub_dir = "controlnet"
-                model.save_pretrained(os.path.join(output_dir, sub_dir))
+                    sub_dir = "controlnet"
+                    model.save_pretrained(os.path.join(output_dir, sub_dir))
 
-                i -= 1
+                    i -= 1
 
         def load_model_hook(models, input_dir):
             while len(models) > 0:
@@ -809,9 +853,9 @@ def main(args):
         " doing mixed precision training, copy of the weights should still be float32."
     )
 
-    if accelerator.unwrap_model(controlnet).dtype != torch.float32:
+    if unwrap_model(controlnet).dtype != torch.float32:
         raise ValueError(
-            f"Controlnet loaded as datatype {accelerator.unwrap_model(controlnet).dtype}. {low_precision_error_string}"
+            f"Controlnet loaded as datatype {unwrap_model(controlnet).dtype}. {low_precision_error_string}"
         )
 
     # Enable TF32 for faster training on Ampere GPUs,
@@ -867,8 +911,8 @@ def main(args):
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
+        num_training_steps=args.max_train_steps * accelerator.num_processes,
         num_cycles=args.lr_num_cycles,
         power=args.lr_power,
     )
@@ -945,7 +989,7 @@ def main(args):
             accelerator.load_state(os.path.join(args.output_dir, path))
             global_step = int(path.split("-")[1])
 
-            initial_global_step = global_step * args.gradient_accumulation_steps
+            initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
     else:
         initial_global_step = 0
@@ -958,6 +1002,7 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
 
+    image_logs = None
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(controlnet):
@@ -977,7 +1022,7 @@ def main(args):
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                encoder_hidden_states = text_encoder(batch["input_ids"], return_dict=False)[0]
 
                 controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
 
@@ -994,9 +1039,12 @@ def main(args):
                     noisy_latents,
                     timesteps,
                     encoder_hidden_states=encoder_hidden_states,
-                    down_block_additional_residuals=down_block_res_samples,
-                    mid_block_additional_residual=mid_block_res_sample,
-                ).sample
+                    down_block_additional_residuals=[
+                        sample.to(dtype=weight_dtype) for sample in down_block_res_samples
+                    ],
+                    mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
+                    return_dict=False,
+                )[0]
 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
@@ -1022,12 +1070,32 @@ def main(args):
 
                 if accelerator.is_main_process:
                     if global_step % args.checkpointing_steps == 0:
+                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+                        if args.checkpoints_total_limit is not None:
+                            checkpoints = os.listdir(args.output_dir)
+                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+
+                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
+                            if len(checkpoints) >= args.checkpoints_total_limit:
+                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                                removing_checkpoints = checkpoints[0:num_to_remove]
+
+                                logger.info(
+                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                                )
+                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+
+                                for removing_checkpoint in removing_checkpoints:
+                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                                    shutil.rmtree(removing_checkpoint)
+
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
                     if args.validation_prompt is not None and global_step % args.validation_steps == 0:
-                        log_validation(
+                        image_logs = log_validation(
                             vae,
                             text_encoder,
                             tokenizer,
@@ -1049,11 +1117,22 @@ def main(args):
     # Create the pipeline using using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        controlnet = accelerator.unwrap_model(controlnet)
+        controlnet = unwrap_model(controlnet)
         controlnet.save_pretrained(args.output_dir)
 
         if args.push_to_hub:
-            repo.push_to_hub(commit_message="End of training", blocking=False, auto_lfs_prune=True)
+            save_model_card(
+                repo_id,
+                image_logs=image_logs,
+                base_model=args.pretrained_model_name_or_path,
+                repo_folder=args.output_dir,
+            )
+            upload_folder(
+                repo_id=repo_id,
+                folder_path=args.output_dir,
+                commit_message="End of training",
+                ignore_patterns=["step_*", "epoch_*"],
+            )
 
     accelerator.end_training()
 

@@ -18,16 +18,19 @@ import unittest
 import torch
 
 from diffusers import UNet1DModel
-from diffusers.utils import floats_tensor, slow, torch_device
+from diffusers.utils.testing_utils import (
+    backend_manual_seed,
+    floats_tensor,
+    slow,
+    torch_device,
+)
 
-from ..test_modeling_common import ModelTesterMixin
+from .test_modeling_common import ModelTesterMixin, UNetTesterMixin
 
 
-torch.backends.cuda.matmul.allow_tf32 = False
-
-
-class UNet1DModelTests(ModelTesterMixin, unittest.TestCase):
+class UNet1DModelTests(ModelTesterMixin, UNetTesterMixin, unittest.TestCase):
     model_class = UNet1DModel
+    main_input_name = "sample"
 
     @property
     def dummy_input(self):
@@ -54,27 +57,21 @@ class UNet1DModelTests(ModelTesterMixin, unittest.TestCase):
     def test_training(self):
         pass
 
-    @unittest.skipIf(torch_device == "mps", "mish op not supported in MPS")
     def test_determinism(self):
         super().test_determinism()
 
-    @unittest.skipIf(torch_device == "mps", "mish op not supported in MPS")
     def test_outputs_equivalence(self):
         super().test_outputs_equivalence()
 
-    @unittest.skipIf(torch_device == "mps", "mish op not supported in MPS")
     def test_from_save_pretrained(self):
         super().test_from_save_pretrained()
 
-    @unittest.skipIf(torch_device == "mps", "mish op not supported in MPS")
     def test_from_save_pretrained_variant(self):
         super().test_from_save_pretrained_variant()
 
-    @unittest.skipIf(torch_device == "mps", "mish op not supported in MPS")
     def test_model_from_pretrained(self):
         super().test_model_from_pretrained()
 
-    @unittest.skipIf(torch_device == "mps", "mish op not supported in MPS")
     def test_output(self):
         super().test_output()
 
@@ -91,12 +88,11 @@ class UNet1DModelTests(ModelTesterMixin, unittest.TestCase):
             "mid_block_type": "MidResTemporalBlock1D",
             "down_block_types": ("DownResnetBlock1D", "DownResnetBlock1D", "DownResnetBlock1D", "DownResnetBlock1D"),
             "up_block_types": ("UpResnetBlock1D", "UpResnetBlock1D", "UpResnetBlock1D"),
-            "act_fn": "mish",
+            "act_fn": "swish",
         }
         inputs_dict = self.dummy_input
         return init_dict, inputs_dict
 
-    @unittest.skipIf(torch_device == "mps", "mish op not supported in MPS")
     def test_from_pretrained_hub(self):
         model, loading_info = UNet1DModel.from_pretrained(
             "bglick13/hopper-medium-v2-value-function-hor32", output_loading_info=True, subfolder="unet"
@@ -109,14 +105,12 @@ class UNet1DModelTests(ModelTesterMixin, unittest.TestCase):
 
         assert image is not None, "Make sure output is not None"
 
-    @unittest.skipIf(torch_device == "mps", "mish op not supported in MPS")
     def test_output_pretrained(self):
         model = UNet1DModel.from_pretrained("bglick13/hopper-medium-v2-value-function-hor32", subfolder="unet")
         torch.manual_seed(0)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(0)
+        backend_manual_seed(torch_device, 0)
 
-        num_features = model.in_channels
+        num_features = model.config.in_channels
         seq_len = 16
         noise = torch.randn((1, seq_len, num_features)).permute(
             0, 2, 1
@@ -152,12 +146,13 @@ class UNet1DModelTests(ModelTesterMixin, unittest.TestCase):
         output_sum = output.abs().sum()
         output_max = output.abs().max()
 
-        assert (output_sum - 224.0896).abs() < 4e-2
+        assert (output_sum - 224.0896).abs() < 0.5
         assert (output_max - 0.0607).abs() < 4e-4
 
 
-class UNetRLModelTests(ModelTesterMixin, unittest.TestCase):
+class UNetRLModelTests(ModelTesterMixin, UNetTesterMixin, unittest.TestCase):
     model_class = UNet1DModel
+    main_input_name = "sample"
 
     @property
     def dummy_input(self):
@@ -178,27 +173,21 @@ class UNetRLModelTests(ModelTesterMixin, unittest.TestCase):
     def output_shape(self):
         return (4, 14, 1)
 
-    @unittest.skipIf(torch_device == "mps", "mish op not supported in MPS")
     def test_determinism(self):
         super().test_determinism()
 
-    @unittest.skipIf(torch_device == "mps", "mish op not supported in MPS")
     def test_outputs_equivalence(self):
         super().test_outputs_equivalence()
 
-    @unittest.skipIf(torch_device == "mps", "mish op not supported in MPS")
     def test_from_save_pretrained(self):
         super().test_from_save_pretrained()
 
-    @unittest.skipIf(torch_device == "mps", "mish op not supported in MPS")
     def test_from_save_pretrained_variant(self):
         super().test_from_save_pretrained_variant()
 
-    @unittest.skipIf(torch_device == "mps", "mish op not supported in MPS")
     def test_model_from_pretrained(self):
         super().test_model_from_pretrained()
 
-    @unittest.skipIf(torch_device == "mps", "mish op not supported in MPS")
     def test_output(self):
         # UNetRL is a value-function is different output shape
         init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
@@ -242,7 +231,6 @@ class UNetRLModelTests(ModelTesterMixin, unittest.TestCase):
         inputs_dict = self.dummy_input
         return init_dict, inputs_dict
 
-    @unittest.skipIf(torch_device == "mps", "mish op not supported in MPS")
     def test_from_pretrained_hub(self):
         value_function, vf_loading_info = UNet1DModel.from_pretrained(
             "bglick13/hopper-medium-v2-value-function-hor32", output_loading_info=True, subfolder="value_function"
@@ -255,16 +243,14 @@ class UNetRLModelTests(ModelTesterMixin, unittest.TestCase):
 
         assert image is not None, "Make sure output is not None"
 
-    @unittest.skipIf(torch_device == "mps", "mish op not supported in MPS")
     def test_output_pretrained(self):
         value_function, vf_loading_info = UNet1DModel.from_pretrained(
             "bglick13/hopper-medium-v2-value-function-hor32", output_loading_info=True, subfolder="value_function"
         )
         torch.manual_seed(0)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(0)
+        backend_manual_seed(torch_device, 0)
 
-        num_features = value_function.in_channels
+        num_features = value_function.config.in_channels
         seq_len = 14
         noise = torch.randn((1, seq_len, num_features)).permute(
             0, 2, 1

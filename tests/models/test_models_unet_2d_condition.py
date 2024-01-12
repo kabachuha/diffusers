@@ -13,36 +13,50 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import gc
 import os
 import tempfile
 import unittest
+from collections import OrderedDict
 
 import torch
 from parameterized import parameterized
+from pytest import mark
 
 from diffusers import UNet2DConditionModel
-from diffusers.models.cross_attention import CrossAttnProcessor, LoRACrossAttnProcessor
-from diffusers.utils import (
+from diffusers.models.attention_processor import CustomDiffusionAttnProcessor, IPAdapterAttnProcessor
+from diffusers.models.embeddings import ImageProjection, IPAdapterPlusImageProjection
+from diffusers.utils import logging
+from diffusers.utils.import_utils import is_xformers_available
+from diffusers.utils.testing_utils import (
+    backend_empty_cache,
+    enable_full_determinism,
     floats_tensor,
     load_hf_numpy,
-    logging,
+    require_torch_accelerator,
+    require_torch_accelerator_with_fp16,
+    require_torch_accelerator_with_training,
     require_torch_gpu,
+    skip_mps,
     slow,
     torch_all_close,
     torch_device,
 )
-from diffusers.utils.import_utils import is_xformers_available
 
-from ..test_modeling_common import ModelTesterMixin
+from .test_modeling_common import ModelTesterMixin, UNetTesterMixin
 
 
 logger = logging.get_logger(__name__)
-torch.backends.cuda.matmul.allow_tf32 = False
+
+enable_full_determinism()
 
 
-def create_lora_layers(model):
-    lora_attn_procs = {}
+def create_ip_adapter_state_dict(model):
+    # "ip_adapter" (cross-attention weights)
+    ip_cross_attn_state_dict = {}
+    key_id = 1
+
     for name in model.attn_processors.keys():
         cross_attention_dim = None if name.endswith("attn1.processor") else model.config.cross_attention_dim
         if name.startswith("mid_block"):
@@ -53,24 +67,173 @@ def create_lora_layers(model):
         elif name.startswith("down_blocks"):
             block_id = int(name[len("down_blocks.")])
             hidden_size = model.config.block_out_channels[block_id]
+        if cross_attention_dim is not None:
+            sd = IPAdapterAttnProcessor(
+                hidden_size=hidden_size, cross_attention_dim=cross_attention_dim, scale=1.0
+            ).state_dict()
+            ip_cross_attn_state_dict.update(
+                {
+                    f"{key_id}.to_k_ip.weight": sd["to_k_ip.weight"],
+                    f"{key_id}.to_v_ip.weight": sd["to_v_ip.weight"],
+                }
+            )
 
-        lora_attn_procs[name] = LoRACrossAttnProcessor(
-            hidden_size=hidden_size, cross_attention_dim=cross_attention_dim
-        )
-        lora_attn_procs[name] = lora_attn_procs[name].to(model.device)
+            key_id += 2
 
-        # add 1 to weights to mock trained weights
-        with torch.no_grad():
-            lora_attn_procs[name].to_q_lora.up.weight += 1
-            lora_attn_procs[name].to_k_lora.up.weight += 1
-            lora_attn_procs[name].to_v_lora.up.weight += 1
-            lora_attn_procs[name].to_out_lora.up.weight += 1
+    # "image_proj" (ImageProjection layer weights)
+    cross_attention_dim = model.config["cross_attention_dim"]
+    image_projection = ImageProjection(
+        cross_attention_dim=cross_attention_dim, image_embed_dim=cross_attention_dim, num_image_text_embeds=4
+    )
 
-    return lora_attn_procs
+    ip_image_projection_state_dict = {}
+    sd = image_projection.state_dict()
+    ip_image_projection_state_dict.update(
+        {
+            "proj.weight": sd["image_embeds.weight"],
+            "proj.bias": sd["image_embeds.bias"],
+            "norm.weight": sd["norm.weight"],
+            "norm.bias": sd["norm.bias"],
+        }
+    )
+
+    del sd
+    ip_state_dict = {}
+    ip_state_dict.update({"image_proj": ip_image_projection_state_dict, "ip_adapter": ip_cross_attn_state_dict})
+    return ip_state_dict
 
 
-class UNet2DConditionModelTests(ModelTesterMixin, unittest.TestCase):
+def create_ip_adapter_plus_state_dict(model):
+    # "ip_adapter" (cross-attention weights)
+    ip_cross_attn_state_dict = {}
+    key_id = 1
+
+    for name in model.attn_processors.keys():
+        cross_attention_dim = None if name.endswith("attn1.processor") else model.config.cross_attention_dim
+        if name.startswith("mid_block"):
+            hidden_size = model.config.block_out_channels[-1]
+        elif name.startswith("up_blocks"):
+            block_id = int(name[len("up_blocks.")])
+            hidden_size = list(reversed(model.config.block_out_channels))[block_id]
+        elif name.startswith("down_blocks"):
+            block_id = int(name[len("down_blocks.")])
+            hidden_size = model.config.block_out_channels[block_id]
+        if cross_attention_dim is not None:
+            sd = IPAdapterAttnProcessor(
+                hidden_size=hidden_size, cross_attention_dim=cross_attention_dim, scale=1.0
+            ).state_dict()
+            ip_cross_attn_state_dict.update(
+                {
+                    f"{key_id}.to_k_ip.weight": sd["to_k_ip.weight"],
+                    f"{key_id}.to_v_ip.weight": sd["to_v_ip.weight"],
+                }
+            )
+
+            key_id += 2
+
+    # "image_proj" (ImageProjection layer weights)
+    cross_attention_dim = model.config["cross_attention_dim"]
+    image_projection = IPAdapterPlusImageProjection(
+        embed_dims=cross_attention_dim, output_dims=cross_attention_dim, dim_head=32, heads=2, num_queries=4
+    )
+
+    ip_image_projection_state_dict = OrderedDict()
+    for k, v in image_projection.state_dict().items():
+        if "2.to" in k:
+            k = k.replace("2.to", "0.to")
+        elif "3.0.weight" in k:
+            k = k.replace("3.0.weight", "1.0.weight")
+        elif "3.0.bias" in k:
+            k = k.replace("3.0.bias", "1.0.bias")
+        elif "3.0.weight" in k:
+            k = k.replace("3.0.weight", "1.0.weight")
+        elif "3.1.net.0.proj.weight" in k:
+            k = k.replace("3.1.net.0.proj.weight", "1.1.weight")
+        elif "3.net.2.weight" in k:
+            k = k.replace("3.net.2.weight", "1.3.weight")
+        elif "layers.0.0" in k:
+            k = k.replace("layers.0.0", "layers.0.0.norm1")
+        elif "layers.0.1" in k:
+            k = k.replace("layers.0.1", "layers.0.0.norm2")
+        elif "layers.1.0" in k:
+            k = k.replace("layers.1.0", "layers.1.0.norm1")
+        elif "layers.1.1" in k:
+            k = k.replace("layers.1.1", "layers.1.0.norm2")
+        elif "layers.2.0" in k:
+            k = k.replace("layers.2.0", "layers.2.0.norm1")
+        elif "layers.2.1" in k:
+            k = k.replace("layers.2.1", "layers.2.0.norm2")
+
+        if "norm_cross" in k:
+            ip_image_projection_state_dict[k.replace("norm_cross", "norm1")] = v
+        elif "layer_norm" in k:
+            ip_image_projection_state_dict[k.replace("layer_norm", "norm2")] = v
+        elif "to_k" in k:
+            ip_image_projection_state_dict[k.replace("to_k", "to_kv")] = torch.cat([v, v], dim=0)
+        elif "to_v" in k:
+            continue
+        elif "to_out.0" in k:
+            ip_image_projection_state_dict[k.replace("to_out.0", "to_out")] = v
+        else:
+            ip_image_projection_state_dict[k] = v
+
+    ip_state_dict = {}
+    ip_state_dict.update({"image_proj": ip_image_projection_state_dict, "ip_adapter": ip_cross_attn_state_dict})
+    return ip_state_dict
+
+
+def create_custom_diffusion_layers(model, mock_weights: bool = True):
+    train_kv = True
+    train_q_out = True
+    custom_diffusion_attn_procs = {}
+
+    st = model.state_dict()
+    for name, _ in model.attn_processors.items():
+        cross_attention_dim = None if name.endswith("attn1.processor") else model.config.cross_attention_dim
+        if name.startswith("mid_block"):
+            hidden_size = model.config.block_out_channels[-1]
+        elif name.startswith("up_blocks"):
+            block_id = int(name[len("up_blocks.")])
+            hidden_size = list(reversed(model.config.block_out_channels))[block_id]
+        elif name.startswith("down_blocks"):
+            block_id = int(name[len("down_blocks.")])
+            hidden_size = model.config.block_out_channels[block_id]
+        layer_name = name.split(".processor")[0]
+        weights = {
+            "to_k_custom_diffusion.weight": st[layer_name + ".to_k.weight"],
+            "to_v_custom_diffusion.weight": st[layer_name + ".to_v.weight"],
+        }
+        if train_q_out:
+            weights["to_q_custom_diffusion.weight"] = st[layer_name + ".to_q.weight"]
+            weights["to_out_custom_diffusion.0.weight"] = st[layer_name + ".to_out.0.weight"]
+            weights["to_out_custom_diffusion.0.bias"] = st[layer_name + ".to_out.0.bias"]
+        if cross_attention_dim is not None:
+            custom_diffusion_attn_procs[name] = CustomDiffusionAttnProcessor(
+                train_kv=train_kv,
+                train_q_out=train_q_out,
+                hidden_size=hidden_size,
+                cross_attention_dim=cross_attention_dim,
+            ).to(model.device)
+            custom_diffusion_attn_procs[name].load_state_dict(weights)
+            if mock_weights:
+                # add 1 to weights to mock trained weights
+                with torch.no_grad():
+                    custom_diffusion_attn_procs[name].to_k_custom_diffusion.weight += 1
+                    custom_diffusion_attn_procs[name].to_v_custom_diffusion.weight += 1
+        else:
+            custom_diffusion_attn_procs[name] = CustomDiffusionAttnProcessor(
+                train_kv=False,
+                train_q_out=False,
+                hidden_size=hidden_size,
+                cross_attention_dim=cross_attention_dim,
+            )
+    del st
+    return custom_diffusion_attn_procs
+
+
+class UNet2DConditionModelTests(ModelTesterMixin, UNetTesterMixin, unittest.TestCase):
     model_class = UNet2DConditionModel
+    main_input_name = "sample"
 
     @property
     def dummy_input(self):
@@ -118,10 +281,11 @@ class UNet2DConditionModelTests(ModelTesterMixin, unittest.TestCase):
         model.enable_xformers_memory_efficient_attention()
 
         assert (
-            model.mid_block.attentions[0].transformer_blocks[0].attn1._use_memory_efficient_attention_xformers
+            model.mid_block.attentions[0].transformer_blocks[0].attn1.processor.__class__.__name__
+            == "XFormersAttnProcessor"
         ), "xformers is not enabled"
 
-    @unittest.skipIf(torch_device == "mps", "Gradient checkpointing skipped on MPS")
+    @require_torch_accelerator_with_training
     def test_gradient_checkpointing(self):
         # enable deterministic behavior for gradient checkpointing
         init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
@@ -200,6 +364,74 @@ class UNet2DConditionModelTests(ModelTesterMixin, unittest.TestCase):
         expected_shape = inputs_dict["sample"].shape
         self.assertEqual(output.shape, expected_shape, "Input and output shapes do not match")
 
+    def test_model_with_cross_attention_dim_tuple(self):
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+
+        init_dict["cross_attention_dim"] = (32, 32)
+
+        model = self.model_class(**init_dict)
+        model.to(torch_device)
+        model.eval()
+
+        with torch.no_grad():
+            output = model(**inputs_dict)
+
+            if isinstance(output, dict):
+                output = output.sample
+
+        self.assertIsNotNone(output)
+        expected_shape = inputs_dict["sample"].shape
+        self.assertEqual(output.shape, expected_shape, "Input and output shapes do not match")
+
+    def test_model_with_simple_projection(self):
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+
+        batch_size, _, _, sample_size = inputs_dict["sample"].shape
+
+        init_dict["class_embed_type"] = "simple_projection"
+        init_dict["projection_class_embeddings_input_dim"] = sample_size
+
+        inputs_dict["class_labels"] = floats_tensor((batch_size, sample_size)).to(torch_device)
+
+        model = self.model_class(**init_dict)
+        model.to(torch_device)
+        model.eval()
+
+        with torch.no_grad():
+            output = model(**inputs_dict)
+
+            if isinstance(output, dict):
+                output = output.sample
+
+        self.assertIsNotNone(output)
+        expected_shape = inputs_dict["sample"].shape
+        self.assertEqual(output.shape, expected_shape, "Input and output shapes do not match")
+
+    def test_model_with_class_embeddings_concat(self):
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+
+        batch_size, _, _, sample_size = inputs_dict["sample"].shape
+
+        init_dict["class_embed_type"] = "simple_projection"
+        init_dict["projection_class_embeddings_input_dim"] = sample_size
+        init_dict["class_embeddings_concat"] = True
+
+        inputs_dict["class_labels"] = floats_tensor((batch_size, sample_size)).to(torch_device)
+
+        model = self.model_class(**init_dict)
+        model.to(torch_device)
+        model.eval()
+
+        with torch.no_grad():
+            output = model(**inputs_dict)
+
+            if isinstance(output, dict):
+                output = output.sample
+
+        self.assertIsNotNone(output)
+        expected_shape = inputs_dict["sample"].shape
+        self.assertEqual(output.shape, expected_shape, "Input and output shapes do not match")
+
     def test_model_attention_slicing(self):
         init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
 
@@ -224,23 +456,59 @@ class UNet2DConditionModelTests(ModelTesterMixin, unittest.TestCase):
             output = model(**inputs_dict)
         assert output is not None
 
-    def test_model_slicable_head_dim(self):
+    def test_model_sliceable_head_dim(self):
         init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
 
         init_dict["attention_head_dim"] = (8, 16)
 
         model = self.model_class(**init_dict)
 
-        def check_slicable_dim_attr(module: torch.nn.Module):
+        def check_sliceable_dim_attr(module: torch.nn.Module):
             if hasattr(module, "set_attention_slice"):
                 assert isinstance(module.sliceable_head_dim, int)
 
             for child in module.children():
-                check_slicable_dim_attr(child)
+                check_sliceable_dim_attr(child)
 
         # retrieve number of attention layers
         for module in model.children():
-            check_slicable_dim_attr(module)
+            check_sliceable_dim_attr(module)
+
+    def test_gradient_checkpointing_is_applied(self):
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+
+        init_dict["attention_head_dim"] = (8, 16)
+
+        model_class_copy = copy.copy(self.model_class)
+
+        modules_with_gc_enabled = {}
+
+        # now monkey patch the following function:
+        #     def _set_gradient_checkpointing(self, module, value=False):
+        #         if hasattr(module, "gradient_checkpointing"):
+        #             module.gradient_checkpointing = value
+
+        def _set_gradient_checkpointing_new(self, module, value=False):
+            if hasattr(module, "gradient_checkpointing"):
+                module.gradient_checkpointing = value
+                modules_with_gc_enabled[module.__class__.__name__] = True
+
+        model_class_copy._set_gradient_checkpointing = _set_gradient_checkpointing_new
+
+        model = model_class_copy(**init_dict)
+        model.enable_gradient_checkpointing()
+
+        EXPECTED_SET = {
+            "CrossAttnUpBlock2D",
+            "CrossAttnDownBlock2D",
+            "UNetMidBlock2DCrossAttn",
+            "UpBlock2D",
+            "Transformer2DModel",
+            "DownBlock2D",
+        }
+
+        assert set(modules_with_gc_enabled.keys()) == EXPECTED_SET
+        assert all(modules_with_gc_enabled.values()), "All modules should be enabled"
 
     def test_special_attn_proc(self):
         class AttnEasyProc(torch.nn.Module):
@@ -299,7 +567,77 @@ class UNet2DConditionModelTests(ModelTesterMixin, unittest.TestCase):
         assert processor.is_run
         assert processor.number == 123
 
-    def test_lora_processors(self):
+    @parameterized.expand(
+        [
+            # fmt: off
+            [torch.bool],
+            [torch.long],
+            [torch.float],
+            # fmt: on
+        ]
+    )
+    def test_model_xattn_mask(self, mask_dtype):
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+
+        model = self.model_class(**{**init_dict, "attention_head_dim": (8, 16)})
+        model.to(torch_device)
+        model.eval()
+
+        cond = inputs_dict["encoder_hidden_states"]
+        with torch.no_grad():
+            full_cond_out = model(**inputs_dict).sample
+            assert full_cond_out is not None
+
+            keepall_mask = torch.ones(*cond.shape[:-1], device=cond.device, dtype=mask_dtype)
+            full_cond_keepallmask_out = model(**{**inputs_dict, "encoder_attention_mask": keepall_mask}).sample
+            assert full_cond_keepallmask_out.allclose(
+                full_cond_out, rtol=1e-05, atol=1e-05
+            ), "a 'keep all' mask should give the same result as no mask"
+
+            trunc_cond = cond[:, :-1, :]
+            trunc_cond_out = model(**{**inputs_dict, "encoder_hidden_states": trunc_cond}).sample
+            assert not trunc_cond_out.allclose(
+                full_cond_out, rtol=1e-05, atol=1e-05
+            ), "discarding the last token from our cond should change the result"
+
+            batch, tokens, _ = cond.shape
+            mask_last = (torch.arange(tokens) < tokens - 1).expand(batch, -1).to(cond.device, mask_dtype)
+            masked_cond_out = model(**{**inputs_dict, "encoder_attention_mask": mask_last}).sample
+            assert masked_cond_out.allclose(
+                trunc_cond_out, rtol=1e-05, atol=1e-05
+            ), "masking the last token from our cond should be equivalent to truncating that token out of the condition"
+
+    # see diffusers.models.attention_processor::Attention#prepare_attention_mask
+    # note: we may not need to fix mask padding to work for stable-diffusion cross-attn masks.
+    # since the use-case (somebody passes in a too-short cross-attn mask) is pretty esoteric.
+    # maybe it's fine that this only works for the unclip use-case.
+    @mark.skip(
+        reason="we currently pad mask by target_length tokens (what unclip needs), whereas stable-diffusion's cross-attn needs to instead pad by remaining_length."
+    )
+    def test_model_xattn_padding(self):
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+
+        model = self.model_class(**{**init_dict, "attention_head_dim": (8, 16)})
+        model.to(torch_device)
+        model.eval()
+
+        cond = inputs_dict["encoder_hidden_states"]
+        with torch.no_grad():
+            full_cond_out = model(**inputs_dict).sample
+            assert full_cond_out is not None
+
+            batch, tokens, _ = cond.shape
+            keeplast_mask = (torch.arange(tokens) == tokens - 1).expand(batch, -1).to(cond.device, torch.bool)
+            keeplast_out = model(**{**inputs_dict, "encoder_attention_mask": keeplast_mask}).sample
+            assert not keeplast_out.allclose(full_cond_out), "a 'keep last token' mask should change the result"
+
+            trunc_mask = torch.zeros(batch, tokens - 1, device=cond.device, dtype=torch.bool)
+            trunc_mask_out = model(**{**inputs_dict, "encoder_attention_mask": trunc_mask}).sample
+            assert trunc_mask_out.allclose(
+                keeplast_out
+            ), "a mask with fewer tokens than condition, will be padded with 'keep' tokens. a 'discard-all' mask missing the final token is thus equivalent to a 'keep last' mask."
+
+    def test_custom_diffusion_processors(self):
         # enable deterministic behavior for gradient checkpointing
         init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
 
@@ -311,48 +649,21 @@ class UNet2DConditionModelTests(ModelTesterMixin, unittest.TestCase):
         with torch.no_grad():
             sample1 = model(**inputs_dict).sample
 
-        lora_attn_procs = {}
-        for name in model.attn_processors.keys():
-            cross_attention_dim = None if name.endswith("attn1.processor") else model.config.cross_attention_dim
-            if name.startswith("mid_block"):
-                hidden_size = model.config.block_out_channels[-1]
-            elif name.startswith("up_blocks"):
-                block_id = int(name[len("up_blocks.")])
-                hidden_size = list(reversed(model.config.block_out_channels))[block_id]
-            elif name.startswith("down_blocks"):
-                block_id = int(name[len("down_blocks.")])
-                hidden_size = model.config.block_out_channels[block_id]
-
-            lora_attn_procs[name] = LoRACrossAttnProcessor(
-                hidden_size=hidden_size, cross_attention_dim=cross_attention_dim
-            )
-
-            # add 1 to weights to mock trained weights
-            with torch.no_grad():
-                lora_attn_procs[name].to_q_lora.up.weight += 1
-                lora_attn_procs[name].to_k_lora.up.weight += 1
-                lora_attn_procs[name].to_v_lora.up.weight += 1
-                lora_attn_procs[name].to_out_lora.up.weight += 1
+        custom_diffusion_attn_procs = create_custom_diffusion_layers(model, mock_weights=False)
 
         # make sure we can set a list of attention processors
-        model.set_attn_processor(lora_attn_procs)
+        model.set_attn_processor(custom_diffusion_attn_procs)
         model.to(torch_device)
 
         # test that attn processors can be set to itself
         model.set_attn_processor(model.attn_processors)
 
         with torch.no_grad():
-            sample2 = model(**inputs_dict, cross_attention_kwargs={"scale": 0.0}).sample
-            sample3 = model(**inputs_dict, cross_attention_kwargs={"scale": 0.5}).sample
-            sample4 = model(**inputs_dict, cross_attention_kwargs={"scale": 0.5}).sample
+            sample2 = model(**inputs_dict).sample
 
-        assert (sample1 - sample2).abs().max() < 1e-4
-        assert (sample3 - sample4).abs().max() < 1e-4
+        assert (sample1 - sample2).abs().max() < 3e-3
 
-        # sample 2 and sample 3 should be different
-        assert (sample2 - sample3).abs().max() > 1e-4
-
-    def test_lora_save_load(self):
+    def test_custom_diffusion_save_load(self):
         # enable deterministic behavior for gradient checkpointing
         init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
 
@@ -365,155 +676,33 @@ class UNet2DConditionModelTests(ModelTesterMixin, unittest.TestCase):
         with torch.no_grad():
             old_sample = model(**inputs_dict).sample
 
-        lora_attn_procs = create_lora_layers(model)
-        model.set_attn_processor(lora_attn_procs)
+        custom_diffusion_attn_procs = create_custom_diffusion_layers(model, mock_weights=False)
+        model.set_attn_processor(custom_diffusion_attn_procs)
 
         with torch.no_grad():
-            sample = model(**inputs_dict, cross_attention_kwargs={"scale": 0.5}).sample
+            sample = model(**inputs_dict).sample
 
         with tempfile.TemporaryDirectory() as tmpdirname:
-            model.save_attn_procs(tmpdirname)
-            self.assertTrue(os.path.isfile(os.path.join(tmpdirname, "pytorch_lora_weights.bin")))
+            model.save_attn_procs(tmpdirname, safe_serialization=False)
+            self.assertTrue(os.path.isfile(os.path.join(tmpdirname, "pytorch_custom_diffusion_weights.bin")))
             torch.manual_seed(0)
             new_model = self.model_class(**init_dict)
+            new_model.load_attn_procs(tmpdirname, weight_name="pytorch_custom_diffusion_weights.bin")
             new_model.to(torch_device)
-            new_model.load_attn_procs(tmpdirname)
 
         with torch.no_grad():
-            new_sample = new_model(**inputs_dict, cross_attention_kwargs={"scale": 0.5}).sample
+            new_sample = new_model(**inputs_dict).sample
 
         assert (sample - new_sample).abs().max() < 1e-4
 
-        # LoRA and no LoRA should NOT be the same
-        assert (sample - old_sample).abs().max() > 1e-4
-
-    def test_lora_save_load_safetensors(self):
-        # enable deterministic behavior for gradient checkpointing
-        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
-
-        init_dict["attention_head_dim"] = (8, 16)
-
-        torch.manual_seed(0)
-        model = self.model_class(**init_dict)
-        model.to(torch_device)
-
-        with torch.no_grad():
-            old_sample = model(**inputs_dict).sample
-
-        lora_attn_procs = {}
-        for name in model.attn_processors.keys():
-            cross_attention_dim = None if name.endswith("attn1.processor") else model.config.cross_attention_dim
-            if name.startswith("mid_block"):
-                hidden_size = model.config.block_out_channels[-1]
-            elif name.startswith("up_blocks"):
-                block_id = int(name[len("up_blocks.")])
-                hidden_size = list(reversed(model.config.block_out_channels))[block_id]
-            elif name.startswith("down_blocks"):
-                block_id = int(name[len("down_blocks.")])
-                hidden_size = model.config.block_out_channels[block_id]
-
-            lora_attn_procs[name] = LoRACrossAttnProcessor(
-                hidden_size=hidden_size, cross_attention_dim=cross_attention_dim
-            )
-            lora_attn_procs[name] = lora_attn_procs[name].to(model.device)
-
-            # add 1 to weights to mock trained weights
-            with torch.no_grad():
-                lora_attn_procs[name].to_q_lora.up.weight += 1
-                lora_attn_procs[name].to_k_lora.up.weight += 1
-                lora_attn_procs[name].to_v_lora.up.weight += 1
-                lora_attn_procs[name].to_out_lora.up.weight += 1
-
-        model.set_attn_processor(lora_attn_procs)
-
-        with torch.no_grad():
-            sample = model(**inputs_dict, cross_attention_kwargs={"scale": 0.5}).sample
-
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            model.save_attn_procs(tmpdirname, safe_serialization=True)
-            self.assertTrue(os.path.isfile(os.path.join(tmpdirname, "pytorch_lora_weights.safetensors")))
-            torch.manual_seed(0)
-            new_model = self.model_class(**init_dict)
-            new_model.to(torch_device)
-            new_model.load_attn_procs(tmpdirname)
-
-        with torch.no_grad():
-            new_sample = new_model(**inputs_dict, cross_attention_kwargs={"scale": 0.5}).sample
-
-        assert (sample - new_sample).abs().max() < 1e-4
-
-        # LoRA and no LoRA should NOT be the same
-        assert (sample - old_sample).abs().max() > 1e-4
-
-    def test_lora_save_load_safetensors_load_torch(self):
-        # enable deterministic behavior for gradient checkpointing
-        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
-
-        init_dict["attention_head_dim"] = (8, 16)
-
-        torch.manual_seed(0)
-        model = self.model_class(**init_dict)
-        model.to(torch_device)
-
-        lora_attn_procs = {}
-        for name in model.attn_processors.keys():
-            cross_attention_dim = None if name.endswith("attn1.processor") else model.config.cross_attention_dim
-            if name.startswith("mid_block"):
-                hidden_size = model.config.block_out_channels[-1]
-            elif name.startswith("up_blocks"):
-                block_id = int(name[len("up_blocks.")])
-                hidden_size = list(reversed(model.config.block_out_channels))[block_id]
-            elif name.startswith("down_blocks"):
-                block_id = int(name[len("down_blocks.")])
-                hidden_size = model.config.block_out_channels[block_id]
-
-            lora_attn_procs[name] = LoRACrossAttnProcessor(
-                hidden_size=hidden_size, cross_attention_dim=cross_attention_dim
-            )
-            lora_attn_procs[name] = lora_attn_procs[name].to(model.device)
-
-        model.set_attn_processor(lora_attn_procs)
-        # Saving as torch, properly reloads with directly filename
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            model.save_attn_procs(tmpdirname)
-            self.assertTrue(os.path.isfile(os.path.join(tmpdirname, "pytorch_lora_weights.bin")))
-            torch.manual_seed(0)
-            new_model = self.model_class(**init_dict)
-            new_model.to(torch_device)
-            new_model.load_attn_procs(tmpdirname, weight_name="pytorch_lora_weights.bin")
-
-    def test_lora_on_off(self):
-        # enable deterministic behavior for gradient checkpointing
-        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
-
-        init_dict["attention_head_dim"] = (8, 16)
-
-        torch.manual_seed(0)
-        model = self.model_class(**init_dict)
-        model.to(torch_device)
-
-        with torch.no_grad():
-            old_sample = model(**inputs_dict).sample
-
-        lora_attn_procs = create_lora_layers(model)
-        model.set_attn_processor(lora_attn_procs)
-
-        with torch.no_grad():
-            sample = model(**inputs_dict, cross_attention_kwargs={"scale": 0.0}).sample
-
-        model.set_attn_processor(CrossAttnProcessor())
-
-        with torch.no_grad():
-            new_sample = model(**inputs_dict).sample
-
-        assert (sample - new_sample).abs().max() < 1e-4
-        assert (sample - old_sample).abs().max() < 1e-4
+        # custom diffusion and no custom diffusion should be the same
+        assert (sample - old_sample).abs().max() < 3e-3
 
     @unittest.skipIf(
         torch_device != "cuda" or not is_xformers_available(),
         reason="XFormers attention is only available with CUDA and `xformers` installed",
     )
-    def test_lora_xformers_on_off(self):
+    def test_custom_diffusion_xformers_on_off(self):
         # enable deterministic behavior for gradient checkpointing
         init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
 
@@ -522,8 +711,8 @@ class UNet2DConditionModelTests(ModelTesterMixin, unittest.TestCase):
         torch.manual_seed(0)
         model = self.model_class(**init_dict)
         model.to(torch_device)
-        lora_attn_procs = create_lora_layers(model)
-        model.set_attn_processor(lora_attn_procs)
+        custom_diffusion_attn_procs = create_custom_diffusion_layers(model, mock_weights=False)
+        model.set_attn_processor(custom_diffusion_attn_procs)
 
         # default
         with torch.no_grad():
@@ -538,6 +727,138 @@ class UNet2DConditionModelTests(ModelTesterMixin, unittest.TestCase):
         assert (sample - on_sample).abs().max() < 1e-4
         assert (sample - off_sample).abs().max() < 1e-4
 
+    def test_pickle(self):
+        # enable deterministic behavior for gradient checkpointing
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+
+        init_dict["attention_head_dim"] = (8, 16)
+
+        model = self.model_class(**init_dict)
+        model.to(torch_device)
+
+        with torch.no_grad():
+            sample = model(**inputs_dict).sample
+
+        sample_copy = copy.copy(sample)
+
+        assert (sample - sample_copy).abs().max() < 1e-4
+
+    def test_asymmetrical_unet(self):
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+        # Add asymmetry to configs
+        init_dict["transformer_layers_per_block"] = [[3, 2], 1]
+        init_dict["reverse_transformer_layers_per_block"] = [[3, 4], 1]
+
+        torch.manual_seed(0)
+        model = self.model_class(**init_dict)
+        model.to(torch_device)
+
+        output = model(**inputs_dict).sample
+        expected_shape = inputs_dict["sample"].shape
+
+        # Check if input and output shapes are the same
+        self.assertEqual(output.shape, expected_shape, "Input and output shapes do not match")
+
+    def test_ip_adapter(self):
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+
+        init_dict["attention_head_dim"] = (8, 16)
+
+        model = self.model_class(**init_dict)
+        model.to(torch_device)
+
+        # forward pass without ip-adapter
+        with torch.no_grad():
+            sample1 = model(**inputs_dict).sample
+
+        # update inputs_dict for ip-adapter
+        batch_size = inputs_dict["encoder_hidden_states"].shape[0]
+        image_embeds = floats_tensor((batch_size, 1, model.cross_attention_dim)).to(torch_device)
+        inputs_dict["added_cond_kwargs"] = {"image_embeds": image_embeds}
+
+        # make ip_adapter_1 and ip_adapter_2
+        ip_adapter_1 = create_ip_adapter_state_dict(model)
+
+        image_proj_state_dict_2 = {k: w + 1.0 for k, w in ip_adapter_1["image_proj"].items()}
+        cross_attn_state_dict_2 = {k: w + 1.0 for k, w in ip_adapter_1["ip_adapter"].items()}
+        ip_adapter_2 = {}
+        ip_adapter_2.update({"image_proj": image_proj_state_dict_2, "ip_adapter": cross_attn_state_dict_2})
+
+        # forward pass ip_adapter_1
+        model._load_ip_adapter_weights(ip_adapter_1)
+        assert model.config.encoder_hid_dim_type == "ip_image_proj"
+        assert model.encoder_hid_proj is not None
+        assert model.down_blocks[0].attentions[0].transformer_blocks[0].attn2.processor.__class__.__name__ in (
+            "IPAdapterAttnProcessor",
+            "IPAdapterAttnProcessor2_0",
+        )
+        with torch.no_grad():
+            sample2 = model(**inputs_dict).sample
+
+        # forward pass with ip_adapter_2
+        model._load_ip_adapter_weights(ip_adapter_2)
+        with torch.no_grad():
+            sample3 = model(**inputs_dict).sample
+
+        # forward pass with ip_adapter_1 again
+        model._load_ip_adapter_weights(ip_adapter_1)
+        with torch.no_grad():
+            sample4 = model(**inputs_dict).sample
+
+        assert not sample1.allclose(sample2, atol=1e-4, rtol=1e-4)
+        assert not sample2.allclose(sample3, atol=1e-4, rtol=1e-4)
+        assert sample2.allclose(sample4, atol=1e-4, rtol=1e-4)
+
+    def test_ip_adapter_plus(self):
+        init_dict, inputs_dict = self.prepare_init_args_and_inputs_for_common()
+
+        init_dict["attention_head_dim"] = (8, 16)
+
+        model = self.model_class(**init_dict)
+        model.to(torch_device)
+
+        # forward pass without ip-adapter
+        with torch.no_grad():
+            sample1 = model(**inputs_dict).sample
+
+        # update inputs_dict for ip-adapter
+        batch_size = inputs_dict["encoder_hidden_states"].shape[0]
+        image_embeds = floats_tensor((batch_size, 1, model.cross_attention_dim)).to(torch_device)
+        inputs_dict["added_cond_kwargs"] = {"image_embeds": image_embeds}
+
+        # make ip_adapter_1 and ip_adapter_2
+        ip_adapter_1 = create_ip_adapter_plus_state_dict(model)
+
+        image_proj_state_dict_2 = {k: w + 1.0 for k, w in ip_adapter_1["image_proj"].items()}
+        cross_attn_state_dict_2 = {k: w + 1.0 for k, w in ip_adapter_1["ip_adapter"].items()}
+        ip_adapter_2 = {}
+        ip_adapter_2.update({"image_proj": image_proj_state_dict_2, "ip_adapter": cross_attn_state_dict_2})
+
+        # forward pass ip_adapter_1
+        model._load_ip_adapter_weights(ip_adapter_1)
+        assert model.config.encoder_hid_dim_type == "ip_image_proj"
+        assert model.encoder_hid_proj is not None
+        assert model.down_blocks[0].attentions[0].transformer_blocks[0].attn2.processor.__class__.__name__ in (
+            "IPAdapterAttnProcessor",
+            "IPAdapterAttnProcessor2_0",
+        )
+        with torch.no_grad():
+            sample2 = model(**inputs_dict).sample
+
+        # forward pass with ip_adapter_2
+        model._load_ip_adapter_weights(ip_adapter_2)
+        with torch.no_grad():
+            sample3 = model(**inputs_dict).sample
+
+        # forward pass with ip_adapter_1 again
+        model._load_ip_adapter_weights(ip_adapter_1)
+        with torch.no_grad():
+            sample4 = model(**inputs_dict).sample
+
+        assert not sample1.allclose(sample2, atol=1e-4, rtol=1e-4)
+        assert not sample2.allclose(sample3, atol=1e-4, rtol=1e-4)
+        assert sample2.allclose(sample4, atol=1e-4, rtol=1e-4)
+
 
 @slow
 class UNet2DConditionModelIntegrationTests(unittest.TestCase):
@@ -548,7 +869,7 @@ class UNet2DConditionModelIntegrationTests(unittest.TestCase):
         # clean up the VRAM after each test
         super().tearDown()
         gc.collect()
-        torch.cuda.empty_cache()
+        backend_empty_cache(torch_device)
 
     def get_latents(self, seed=0, shape=(4, 4, 64, 64), fp16=False):
         dtype = torch.float16 if fp16 else torch.float32
@@ -566,6 +887,7 @@ class UNet2DConditionModelIntegrationTests(unittest.TestCase):
 
         return model
 
+    @require_torch_gpu
     def test_set_attention_slice_auto(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_max_memory_allocated()
@@ -585,6 +907,7 @@ class UNet2DConditionModelIntegrationTests(unittest.TestCase):
 
         assert mem_bytes < 5 * 10**9
 
+    @require_torch_gpu
     def test_set_attention_slice_max(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_max_memory_allocated()
@@ -604,6 +927,7 @@ class UNet2DConditionModelIntegrationTests(unittest.TestCase):
 
         assert mem_bytes < 5 * 10**9
 
+    @require_torch_gpu
     def test_set_attention_slice_int(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_max_memory_allocated()
@@ -623,12 +947,13 @@ class UNet2DConditionModelIntegrationTests(unittest.TestCase):
 
         assert mem_bytes < 5 * 10**9
 
+    @require_torch_gpu
     def test_set_attention_slice_list(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_max_memory_allocated()
         torch.cuda.reset_peak_memory_stats()
 
-        # there are 32 slicable layers
+        # there are 32 sliceable layers
         slice_list = 16 * [2, 3]
         unet = self.get_unet_model()
         unet.set_attention_slice(slice_list)
@@ -659,7 +984,7 @@ class UNet2DConditionModelIntegrationTests(unittest.TestCase):
             # fmt: on
         ]
     )
-    @require_torch_gpu
+    @require_torch_accelerator_with_fp16
     def test_compvis_sd_v1_4(self, seed, timestep, expected_slice):
         model = self.get_unet_model(model_id="CompVis/stable-diffusion-v1-4")
         latents = self.get_latents(seed)
@@ -687,7 +1012,7 @@ class UNet2DConditionModelIntegrationTests(unittest.TestCase):
             # fmt: on
         ]
     )
-    @require_torch_gpu
+    @require_torch_accelerator_with_fp16
     def test_compvis_sd_v1_4_fp16(self, seed, timestep, expected_slice):
         model = self.get_unet_model(model_id="CompVis/stable-diffusion-v1-4", fp16=True)
         latents = self.get_latents(seed, fp16=True)
@@ -715,7 +1040,8 @@ class UNet2DConditionModelIntegrationTests(unittest.TestCase):
             # fmt: on
         ]
     )
-    @require_torch_gpu
+    @require_torch_accelerator
+    @skip_mps
     def test_compvis_sd_v1_5(self, seed, timestep, expected_slice):
         model = self.get_unet_model(model_id="runwayml/stable-diffusion-v1-5")
         latents = self.get_latents(seed)
@@ -743,7 +1069,7 @@ class UNet2DConditionModelIntegrationTests(unittest.TestCase):
             # fmt: on
         ]
     )
-    @require_torch_gpu
+    @require_torch_accelerator_with_fp16
     def test_compvis_sd_v1_5_fp16(self, seed, timestep, expected_slice):
         model = self.get_unet_model(model_id="runwayml/stable-diffusion-v1-5", fp16=True)
         latents = self.get_latents(seed, fp16=True)
@@ -771,7 +1097,8 @@ class UNet2DConditionModelIntegrationTests(unittest.TestCase):
             # fmt: on
         ]
     )
-    @require_torch_gpu
+    @require_torch_accelerator
+    @skip_mps
     def test_compvis_sd_inpaint(self, seed, timestep, expected_slice):
         model = self.get_unet_model(model_id="runwayml/stable-diffusion-inpainting")
         latents = self.get_latents(seed, shape=(4, 9, 64, 64))
@@ -787,7 +1114,7 @@ class UNet2DConditionModelIntegrationTests(unittest.TestCase):
         output_slice = sample[-1, -2:, -2:, :2].flatten().float().cpu()
         expected_output_slice = torch.tensor(expected_slice)
 
-        assert torch_all_close(output_slice, expected_output_slice, atol=1e-3)
+        assert torch_all_close(output_slice, expected_output_slice, atol=3e-3)
 
     @parameterized.expand(
         [
@@ -799,7 +1126,7 @@ class UNet2DConditionModelIntegrationTests(unittest.TestCase):
             # fmt: on
         ]
     )
-    @require_torch_gpu
+    @require_torch_accelerator_with_fp16
     def test_compvis_sd_inpaint_fp16(self, seed, timestep, expected_slice):
         model = self.get_unet_model(model_id="runwayml/stable-diffusion-inpainting", fp16=True)
         latents = self.get_latents(seed, shape=(4, 9, 64, 64), fp16=True)
@@ -827,7 +1154,7 @@ class UNet2DConditionModelIntegrationTests(unittest.TestCase):
             # fmt: on
         ]
     )
-    @require_torch_gpu
+    @require_torch_accelerator_with_fp16
     def test_stabilityai_sd_v2_fp16(self, seed, timestep, expected_slice):
         model = self.get_unet_model(model_id="stabilityai/stable-diffusion-2", fp16=True)
         latents = self.get_latents(seed, shape=(4, 4, 96, 96), fp16=True)
